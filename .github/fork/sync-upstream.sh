@@ -19,7 +19,7 @@ UPSTREAM_API="https://api.github.com/repos/XTLS/Xray-core/releases/latest"
 REF="${1:-latest-release}"
 
 # Packages the fork changes or depends on. Keep in sync with fork-release.yml.
-FORK_PACKAGES=(./app/speedlimit/... ./app/dispatcher/... ./common/protocol/... ./infra/conf/... ./core/...)
+FORK_PACKAGES=(./app/speedlimit/... ./app/dispatcher/... ./common/protocol/... ./infra/conf/... ./core/... ./testing/fork/...)
 
 fail() {
 	echo "error: $*" >&2
@@ -29,6 +29,9 @@ fail() {
 if ! [[ "$REF" =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*$ ]]; then
 	fail "invalid upstream ref: $REF"
 fi
+case "$(git rev-parse --abbrev-ref HEAD)" in
+stable/*) fail "refusing to merge upstream into a frozen stable/* branch" ;;
+esac
 if ! git diff-index --quiet HEAD --; then
 	fail "working tree has uncommitted changes"
 fi
@@ -96,7 +99,7 @@ fi
 # Git only checks text. Compile and test to catch semantic conflicts.
 echo
 echo "Verifying the merge..."
-if ! go build ./... || ! go vet "${FORK_PACKAGES[@]}" || ! go test -count=1 -timeout 20m "${FORK_PACKAGES[@]}"; then
+if ! go build ./... || ! go vet -unreachable=false "${FORK_PACKAGES[@]}" || ! go test -count=1 -timeout 20m "${FORK_PACKAGES[@]}"; then
 	echo
 	echo "VERIFY FAILED: upstream $REF merged cleanly but does not build or pass tests."
 	echo "See FORK_MAINTENANCE.md, section 'Semantic conflicts'."

@@ -13,6 +13,27 @@ conflicts, changing CI or publishing a release. Feature behaviour and config are
 - **Part B, extended sniffing:** QUIC v2, ClientHello reassembly (QUIC and TLS),
   BitTorrent uTP/DHT/UDP tracker, ported from Jolymmiles/Xray-core.
 
+## Fork hooks in upstream files
+
+Fork logic lives in new files. Upstream files carry only these hooks. If a merge loses
+one, the feature silently stops working, so check them after every sync:
+
+```bash
+grep -rn "// fork" app/dispatcher/default.go transport/internet/splithttp/ infra/conf/xray.go
+grep -n "applySpeedlimitUploadDefaults\|SetEmbeddedConfig" infra/conf/xray.go
+```
+
+| Upstream file | Hook | Why |
+|---------------|------|-----|
+| `app/dispatcher/default.go`, `getLink` | `limitPipeLink(...)` | Limits `Dispatch` paths: Trojan, VMess, Shadowsocks, mux |
+| `app/dispatcher/default.go`, `WrapLink` | `limitDirectLink(...)`, **before** `TimeoutWrapperReader` | Limits `DispatchLink` paths: VLESS on any transport, SOCKS, HTTP, Hysteria, TUN |
+| `transport/internet/splithttp/hub.go`, POST branch | `enterPostRead` / `leavePostRead`, **before** the body is read | Stops packet-up uploads stalling a shared connection |
+| `transport/internet/splithttp/upload_queue.go` | `postSlots` field and its `make` | Used by the hook above |
+| `infra/conf/xray.go` | `Speedlimit` field, `Override` branch, `Build` block | Reads the config and sets upload buffer defaults |
+
+The heavy exception is the sniffer: `common/protocol/quic/sniff.go`, `tls/sniff.go` and
+`bittorrent/bittorrent.go` are rewritten, not hooked. See the conflict table below.
+
 ## Rules
 
 1. **Merge upstream; never rebase or force-push `main`.** Release tags point into its
@@ -28,6 +49,13 @@ conflicts, changing CI or publishing a release. Feature behaviour and config are
    (`fork-*.yml`, `app/speedlimit/`). Every line in an upstream file is a future conflict.
 7. **Keep the module path `github.com/xtls/xray-core`.** Renaming it touches every file
    and makes every sync conflict.
+
+## Frozen branch
+
+`stable/v26.10.31-fork` is the known-good fallback and **never takes upstream merges**.
+`sync-upstream.sh` and `fork-sync-upstream.yml` refuse `stable/*`. To go back to it, deploy
+its release, or branch from it to fix something. Create a new `stable/<version>-fork`
+branch after a verified release instead of moving an old one.
 
 ## History
 
@@ -128,7 +156,7 @@ Finish:
 ```bash
 git diff --check          # no markers left behind
 git add <files> && git commit --no-edit
-go build ./... && go test -count=1 ./app/speedlimit/... ./app/dispatcher/... ./common/protocol/... ./infra/conf/... ./core/...
+go build ./... && go test -count=1 ./app/speedlimit/... ./app/dispatcher/... ./common/protocol/... ./infra/conf/... ./core/... ./testing/fork/...
 ```
 
 Add one line per non-trivial resolution to the merge commit message.
@@ -147,19 +175,39 @@ if nameLen == 0 {
 The fork had changed that function to return `(string, error)`. Git reported no conflict,
 and the compiler failed with `not enough return values`. The fix is `return "", errNotClientHello`.
 
+A newer `go vet` may also flag upstream's dead code. `-unreachable=false` is deliberate:
+do not delete upstream's code to satisfy it.
+
 Also check what the compiler cannot:
 
 - **Fixes that bypass the fork's code path.** Upstream's sniffer fixes target upstream's
   code. `9b8190f5` ("QUIC sniffer: Don't accept ClientHello with gaps") changed only
   `tls/sniff.go` while the fork's QUIC reassembly has its own gap logic. Read each upstream
   sniffer commit and confirm that the behaviour holds in the fork, adding a test if not.
-- **Changed interfaces around the limiter:** `buf.Writer`, `getLink`, `SizeStatWriter`, or
-  how the user's email reaches the dispatcher. After such a change, confirm that
-  `WrapUp`/`WrapDown` are still applied.
+- **Changed paths around the limiter:** `buf.Writer`, `getLink`, `WrapLink`, `SizeStatWriter`,
+  splice (`CanSpliceCopy`), or how the user's email reaches the dispatcher. A new way to
+  move data can silently bypass the limiter, and unit tests will still pass. Only
+  `testing/fork` measures real traffic. Never skip or loosen it to get a sync through.
 - **Config handling:** `speedLimit` must still parse, and bad values must still refuse to
   start. Test with `xray run -test -c config.json`.
 
 The sync script prints files changed by both sides. Read those diffs even when all is green.
+
+## Limiter design
+
+- **Unlimited users stay on upstream's path.** `MayLimit()` is false, so they get no
+  wrappers and keep splice. Limited users lose splice: it would skip the limiter.
+- **Shared connections.** Throttling a stream fills its receive buffer. If the buffers
+  exceed the connection window, other flows on that connection stall. So when `speedLimit`
+  is set, `applySpeedlimitUploadDefaults` gives XHTTP and Hysteria inbounds per-stream
+  buffers that are small compared with the connection window. Values set in the config win.
+- **Known limitation: mux upload.** Mux has no per-stream flow control, so a throttled upload
+  stalls other TCP flows in the same mux tunnel. Download is fine. Fixing it would need a
+  mux redesign, so advise leaving mux off for limited users instead.
+- **Upload is less smooth than download through a real bottleneck.** The server slows a
+  client only through backpressure, after data has crossed the link.
+
+Test on Linux. Windows has no splice, so a pass there proves little.
 
 ## CI
 
@@ -223,7 +271,9 @@ release matrix changed, port the change to the matrix in `fork-release.yml`.
 - [ ] No conflict markers: `git diff --check HEAD^1 HEAD`
 - [ ] `go build ./...` and the fork package tests pass
 - [ ] Diffs in the "changed by both" list were read
-- [ ] `app/dispatcher/default.go` still calls the limiter and `SniffDatagrams`
+- [ ] All hooks in [Fork hooks](#fork-hooks-in-upstream-files) are present
+- [ ] `go test ./testing/fork/...` passes on Linux, unmodified
+- [ ] `app/dispatcher/default.go` still calls `SniffDatagrams`
 - [ ] `xray run -test -c` accepts a config with `speedLimit`
 - [ ] `core/core.go` carries upstream's version
 - [ ] Non-trivial resolutions are recorded in the merge commit message

@@ -34,6 +34,8 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
+    # Frozen stable/* branches never take upstream merges.
+    if: ${{ !startsWith(inputs.target_branch, 'stable/') }}
     permissions:
       contents: write
       issues: write
