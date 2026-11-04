@@ -145,11 +145,15 @@ func cases() []transportCase {
 	const fast, packet = 100 * time.Millisecond, 200 * time.Millisecond
 
 	out := []transportCase{
-		{name: "raw", vless: true, maxPingP95: fast,
-			server: obj{"network": "tcp", "security": "none"}, client: obj{"network": "tcp", "security": "none"}},
-		{name: "websocket", vless: true, maxPingP95: fast,
+		{
+			name: "raw", vless: true, maxPingP95: fast,
+			server: obj{"network": "tcp", "security": "none"}, client: obj{"network": "tcp", "security": "none"},
+		},
+		{
+			name: "websocket", vless: true, maxPingP95: fast,
 			server: obj{"network": "ws", "security": "none", "wsSettings": obj{"path": "/w"}},
-			client: obj{"network": "ws", "security": "none", "wsSettings": obj{"path": "/w"}}},
+			client: obj{"network": "ws", "security": "none", "wsSettings": obj{"path": "/w"}},
+		},
 	}
 	for _, alpn := range []string{"h2", "h3"} {
 		for _, mode := range []string{"stream-one", "stream-up", "packet-up"} {
@@ -185,8 +189,10 @@ func startProxy(t *testing.T, tc transportCase, s *servers) (echo, bulk, sink in
 		inbound["protocol"] = "vless"
 		inbound["settings"] = obj{"clients": []obj{{"id": userID, "email": email}}, "decryption": "none"}
 		outbound["protocol"] = "vless"
-		outbound["settings"] = obj{"vnext": []obj{{"address": "127.0.0.1", "port": proxyPort,
-			"users": []obj{{"id": userID, "encryption": "none"}}}}}
+		outbound["settings"] = obj{"vnext": []obj{{
+			"address": "127.0.0.1", "port": proxyPort,
+			"users": []obj{{"id": userID, "encryption": "none"}},
+		}}}
 	} else {
 		inbound["protocol"] = "hysteria"
 		inbound["settings"] = obj{"version": 2, "clients": []obj{{"auth": "secret", "email": email}}}
@@ -196,8 +202,10 @@ func startProxy(t *testing.T, tc transportCase, s *servers) (echo, bulk, sink in
 	startXray(t, obj{
 		"log":      obj{"loglevel": "none"},
 		"inbounds": []obj{inbound},
-		"outbounds": []obj{{"protocol": "freedom",
-			"settings": obj{"finalRules": []obj{{"action": "allow", "ip": []string{"127.0.0.0/8"}}}}}},
+		"outbounds": []obj{{
+			"protocol": "freedom",
+			"settings": obj{"finalRules": []obj{{"action": "allow", "ip": []string{"127.0.0.0/8"}}}},
+		}},
 		"speedLimit": obj{"enabled": true, "default": obj{"down": limitKbps, "up": limitKbps}},
 	})
 	if tc.udpServer {
@@ -206,8 +214,10 @@ func startProxy(t *testing.T, tc transportCase, s *servers) (echo, bulk, sink in
 
 	echo, bulk, sink = freePort(t), freePort(t), freePort(t)
 	door := func(port, target int) obj {
-		return obj{"listen": "127.0.0.1", "port": port, "protocol": "dokodemo-door",
-			"settings": obj{"address": "127.0.0.1", "port": target, "network": "tcp"}}
+		return obj{
+			"listen": "127.0.0.1", "port": port, "protocol": "dokodemo-door",
+			"settings": obj{"address": "127.0.0.1", "port": target, "network": "tcp"},
+		}
 	}
 	startXray(t, obj{
 		"log":       obj{"loglevel": "none"},

@@ -261,6 +261,9 @@ release matrix changed, port the change to the matrix in `fork-release.yml`.
   `refs/heads/main`.
 - **`core.autocrlf=true` makes `gofmt -l` list nearly every file.** The working copy has
   CRLF while the blobs have LF. Trust CI (`vformat`) or run `git ls-files --eol`.
+- `go run ./infra/vformat/main.go` rewrites line endings across the whole repository on
+  Windows, which marks about 1,000 files as modified. Check with
+  `git diff --ignore-cr-at-eol --stat`, keep your own files and restore the rest.
 - `.github/build/windows/*` are intentionally CRLF. Do not normalize them.
 - `go.mod` requires a newer Go than may be installed. Leave `GOTOOLCHAIN=auto` so that Go
   downloads the right toolchain. `-race` needs cgo, so run it on Linux CI.

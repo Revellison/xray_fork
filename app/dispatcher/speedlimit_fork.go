@@ -51,4 +51,3 @@ func disableSplice(inbound *session.Inbound) {
 		inbound.CanSpliceCopy = 3
 	}
 }
-
