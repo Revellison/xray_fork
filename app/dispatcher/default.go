@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xtls/xray-core/app/speedlimit"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -28,25 +29,74 @@ var errSniffingTimeout = errors.New("timeout on sniffing")
 
 type cachedReader struct {
 	sync.Mutex
-	reader buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
-	cache  buf.MultiBuffer
+	reader  buf.TimeoutReader // *pipe.Reader or *buf.TimeoutWrapperReader
+	cache   buf.MultiBuffer
+	scratch *buf.Buffer
+	// datagrams holds the cached buffers the last payload concatenates, each
+	// on its own: the datagrams of a UDP flow.
+	datagrams [][]byte
 }
 
-func (r *cachedReader) Cache(b *buf.Buffer, deadline time.Duration) error {
+func newCachedReader(reader buf.TimeoutReader) *cachedReader {
+	return &cachedReader{reader: reader}
+}
+
+func (r *cachedReader) Cache(deadline time.Duration) ([]byte, error) {
 	mb, err := r.reader.ReadMultiBufferTimeout(deadline)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	r.Lock()
 	if !mb.IsEmpty() {
-		r.cache, _ = buf.MergeMulti(r.cache, mb)
+		if r.cache.IsEmpty() {
+			r.cache = mb
+		} else {
+			r.cache, _ = buf.MergeMulti(r.cache, mb)
+		}
 	}
-	b.Clear()
-	rawBytes := b.Extend(min(r.cache.Len(), b.Cap()))
+	if len(r.cache) == 1 && r.cache[0] != nil {
+		payload := r.cache[0].Bytes()
+		r.Unlock()
+		return payload, nil
+	}
+	if r.scratch == nil {
+		r.scratch = buf.NewWithSize(32767)
+	}
+	r.scratch.Clear()
+	rawBytes := r.scratch.Extend(min(r.cache.Len(), r.scratch.Cap()))
 	n := r.cache.Copy(rawBytes)
-	b.Resize(0, int32(n))
+	r.scratch.Resize(0, int32(n))
 	r.Unlock()
-	return nil
+	return r.scratch.Bytes(), nil
+}
+
+// Datagrams returns the buffers the payload the last Cache returned
+// concatenates, each on its own, as far as that payload holds them whole: the
+// datagrams of a UDP flow as the outbound sends them, even where an inbound
+// merged or split the client's datagrams. Freedom sends each buffer of a UDP
+// link as a datagram of its own, and the framings of the proxy outbounds carry
+// each buffer of up to quic.MaxProxiedDatagram bytes whole to their servers.
+// A proxy outbound may drop a longer one, so the QUIC sniffer names no server
+// once it meets one. Like the payload, they are borrowed until the cache is
+// read.
+func (r *cachedReader) Datagrams() [][]byte {
+	r.Lock()
+	defer r.Unlock()
+	if cap(r.datagrams) < len(r.cache) {
+		// Room for the first few datagrams at once, as the cache grows.
+		r.datagrams = make([][]byte, 0, max(len(r.cache), 4))
+	}
+	r.datagrams = r.datagrams[:0]
+	size := int32(0)
+	for _, b := range r.cache {
+		// A payload of several buffers holds as many bytes as the scratch.
+		if len(r.cache) > 1 && size+b.Len() > r.scratch.Len() {
+			break
+		}
+		r.datagrams = append(r.datagrams, b.Bytes())
+		size += b.Len()
+	}
+	return r.datagrams
 }
 
 func (r *cachedReader) readInternal() buf.MultiBuffer {
@@ -56,6 +106,11 @@ func (r *cachedReader) readInternal() buf.MultiBuffer {
 	if r.cache != nil && !r.cache.IsEmpty() {
 		mb := r.cache
 		r.cache = nil
+		r.datagrams = nil
+		if r.scratch != nil {
+			r.scratch.Release()
+			r.scratch = nil
+		}
 		return mb
 	}
 
@@ -84,6 +139,11 @@ func (r *cachedReader) Interrupt() {
 	r.Lock()
 	if r.cache != nil {
 		r.cache = buf.ReleaseMulti(r.cache)
+	}
+	r.datagrams = nil
+	if r.scratch != nil {
+		r.scratch.Release()
+		r.scratch = nil
 	}
 	r.Unlock()
 	if p, ok := r.reader.(*pipe.Reader); ok {
@@ -137,7 +197,7 @@ func (*DefaultDispatcher) Start() error {
 // Close implements common.Closable.
 func (*DefaultDispatcher) Close() error { return nil }
 
-func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *transport.Link) {
+func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*transport.Link, *transport.Link) {
 	opt := pipe.OptionsFromContext(ctx)
 	uplinkReader, uplinkWriter := pipe.New(opt...)
 	downlinkReader, downlinkWriter := pipe.New(opt...)
@@ -181,6 +241,14 @@ func (d *DefaultDispatcher) getLink(ctx context.Context) (*transport.Link, *tran
 
 		if p.Stats.UserOnline {
 			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
+		}
+
+		// Per-user rate limiting. Default() is nil when the config has no
+		// "speedLimit" section, and User() returns nil for unlimited users,
+		// so the whole block costs nothing when the feature is off.
+		if us := speedlimit.Default().User(user.Email); us != nil {
+			inboundLink.Writer = us.WrapUp(ctx, inboundLink.Writer, network)
+			outboundLink.Writer = us.WrapDown(ctx, outboundLink.Writer, network)
 		}
 	}
 
@@ -283,14 +351,12 @@ func (d *DefaultDispatcher) Dispatch(ctx context.Context, destination net.Destin
 	}
 
 	sniffingRequest := content.SniffingRequest
-	inbound, outbound := d.getLink(ctx)
+	inbound, outbound := d.getLink(ctx, destination.Network)
 	if !sniffingRequest.Enabled {
 		go d.routedDispatch(ctx, outbound, destination)
 	} else {
 		go func() {
-			cReader := &cachedReader{
-				reader: outbound.Reader.(*pipe.Reader),
-			}
+			cReader := newCachedReader(outbound.Reader.(*pipe.Reader))
 			outbound.Reader = cReader
 			result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 			if err == nil {
@@ -343,9 +409,7 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 	if !sniffingRequest.Enabled {
 		d.routedDispatch(ctx, outbound, destination)
 	} else {
-		cReader := &cachedReader{
-			reader: outbound.Reader.(buf.TimeoutReader),
-		}
+		cReader := newCachedReader(outbound.Reader.(buf.TimeoutReader))
 		outbound.Reader = cReader
 		result, err := sniffer(ctx, cReader, sniffingRequest.MetadataOnly, destination.Network)
 		if err == nil {
@@ -376,11 +440,10 @@ func (d *DefaultDispatcher) DispatchLink(ctx context.Context, destination net.De
 }
 
 func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network) (SniffResult, error) {
-	payload := buf.NewWithSize(32767)
-	defer payload.Release()
+	return sniff(ctx, cReader, metadataOnly, network, newSniffer(ctx))
+}
 
-	sniffer := NewSniffer(ctx)
-
+func sniff(ctx context.Context, cReader *cachedReader, metadataOnly bool, network net.Network, sniffer Sniffer) (SniffResult, error) {
 	metaresult, metadataErr := sniffer.SniffMetadata(ctx)
 
 	if metadataOnly {
@@ -396,15 +459,17 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 				return nil, ctx.Err()
 			default:
 				cachingStartingTimeStamp := time.Now()
-				err := cReader.Cache(payload, cacheDeadline)
+				payloadBytes, err := cReader.Cache(cacheDeadline)
 				if err != nil {
 					return nil, err
 				}
-				cachingTimeElapsed := time.Since(cachingStartingTimeStamp)
-				cacheDeadline -= cachingTimeElapsed
 
-				if !payload.IsEmpty() {
-					result, err := sniffer.Sniff(ctx, payload.Bytes(), network)
+				if len(payloadBytes) != 0 {
+					var datagrams [][]byte
+					if network == net.Network_UDP {
+						datagrams = cReader.Datagrams()
+					}
+					result, err := sniffer.SniffDatagrams(ctx, payloadBytes, datagrams, network)
 					switch err {
 					case common.ErrNoClue: // No Clue: protocol not matches, and sniffer cannot determine whether there will be a match or not
 						totalAttempt++
@@ -416,6 +481,7 @@ func sniffer(ctx context.Context, cReader *cachedReader, metadataOnly bool, netw
 				} else {
 					totalAttempt++
 				}
+				cacheDeadline -= time.Since(cachingStartingTimeStamp)
 				if totalAttempt >= 2 || cacheDeadline <= 0 {
 					return nil, errSniffingTimeout
 				}

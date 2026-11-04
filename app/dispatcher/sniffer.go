@@ -20,8 +20,16 @@ type SniffResult interface {
 
 type protocolSniffer func(context.Context, []byte) (SniffResult, error)
 
+// datagramSniffer sniffs a UDP flow from its datagrams kept apart; payload
+// concatenates them, as a protocolSniffer reads them.
+type datagramSniffer func(ctx context.Context, payload []byte, datagrams [][]byte) (SniffResult, error)
+
 type protocolSnifferWithMetadata struct {
 	protocolSniffer protocolSniffer
+	// datagramSniffer, when set, takes the place of protocolSniffer when the
+	// datagrams of a UDP flow can be told apart.
+	datagramSniffer datagramSniffer
+	fastHTTP        bool
 	// A Metadata sniffer will be invoked on connection establishment only, with nil body,
 	// for both TCP and UDP connections
 	// It will not be shown as a traffic type for routing unless there is no other successful sniffing.
@@ -30,20 +38,39 @@ type protocolSnifferWithMetadata struct {
 }
 
 type Sniffer struct {
-	sniffer []protocolSnifferWithMetadata
+	sniffer     []protocolSnifferWithMetadata
+	fastHTTP    protocolSniffer
+	hasMetadata bool
+}
+
+var defaultProtocolSniffers = [...]protocolSnifferWithMetadata{
+	{protocolSniffer: func(_ context.Context, b []byte) (SniffResult, error) { return tls.SniffTLS(b) }, network: net.Network_TCP},
+	{protocolSniffer: func(c context.Context, b []byte) (SniffResult, error) { return http.SniffHTTP(b, c) }, fastHTTP: true, network: net.Network_TCP},
+	{protocolSniffer: func(_ context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffBittorrent(b) }, network: net.Network_TCP},
+	{
+		protocolSniffer: func(_ context.Context, b []byte) (SniffResult, error) { return quic.SniffQUIC(b) },
+		datagramSniffer: func(_ context.Context, _ []byte, datagrams [][]byte) (SniffResult, error) {
+			return quic.SniffQUICDatagrams(datagrams)
+		},
+		network: net.Network_UDP,
+	},
+	{protocolSniffer: func(_ context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) }, network: net.Network_UDP},
+	{protocolSniffer: func(_ context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffDHT(b) }, network: net.Network_UDP},
+	{protocolSniffer: func(_ context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUDPTracker(b) }, network: net.Network_UDP},
 }
 
 func NewSniffer(ctx context.Context) *Sniffer {
-	ret := &Sniffer{
-		sniffer: []protocolSnifferWithMetadata{
-			{func(c context.Context, b []byte) (SniffResult, error) { return http.SniffHTTP(b, c) }, false, net.Network_TCP},
-			{func(c context.Context, b []byte) (SniffResult, error) { return tls.SniffTLS(b) }, false, net.Network_TCP},
-			{func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffBittorrent(b) }, false, net.Network_TCP},
-			{func(c context.Context, b []byte) (SniffResult, error) { return quic.SniffQUIC(b) }, false, net.Network_UDP},
-			{func(c context.Context, b []byte) (SniffResult, error) { return bittorrent.SniffUTP(b) }, false, net.Network_UDP},
-		},
+	ret := newSniffer(ctx)
+	return &ret
+}
+
+func newSniffer(ctx context.Context) Sniffer {
+	ret := Sniffer{
+		sniffer:  defaultProtocolSniffers[:],
+		fastHTTP: defaultProtocolSniffers[1].protocolSniffer,
 	}
 	if sniffer, err := newFakeDNSSniffer(ctx); err == nil {
+		ret.hasMetadata = true
 		others := ret.sniffer
 		ret.sniffer = append(ret.sniffer, sniffer)
 		fakeDNSThenOthers, err := newFakeDNSThenOthers(ctx, sniffer, others)
@@ -57,13 +84,51 @@ func NewSniffer(ctx context.Context) *Sniffer {
 var errUnknownContent = errors.New("unknown content")
 
 func (s *Sniffer) Sniff(c context.Context, payload []byte, network net.Network) (SniffResult, error) {
+	return s.SniffDatagrams(c, payload, nil, network)
+}
+
+// SniffDatagrams is Sniff for a payload that concatenates the datagrams of a
+// UDP flow, given apart as well: a sniffer that reads datagrams on their own
+// gets them, the others the payload.
+func (s *Sniffer) SniffDatagrams(c context.Context, payload []byte, datagrams [][]byte, network net.Network) (SniffResult, error) {
 	var pendingSniffer []protocolSnifferWithMetadata
+	var precheckedHTTPResult SniffResult
+	var precheckedHTTPError error
+	httpPrechecked := false
+	if network == net.Network_TCP && len(payload) != 0 && payload[0] != 0x16 {
+		if s.fastHTTP != nil {
+			precheckedHTTPResult, precheckedHTTPError = s.fastHTTP(c, payload)
+			httpPrechecked = true
+			if precheckedHTTPError == nil && precheckedHTTPResult != nil {
+				return precheckedHTTPResult, nil
+			}
+		} else {
+			for _, si := range s.sniffer {
+				if !si.fastHTTP || si.metadataSniffer || si.network != network {
+					continue
+				}
+				precheckedHTTPResult, precheckedHTTPError = si.protocolSniffer(c, payload)
+				httpPrechecked = true
+				if precheckedHTTPError == nil && precheckedHTTPResult != nil {
+					return precheckedHTTPResult, nil
+				}
+				break
+			}
+		}
+	}
 	for _, si := range s.sniffer {
 		protocolSniffer := si.protocolSniffer
 		if si.metadataSniffer || si.network != network {
 			continue
 		}
-		result, err := protocolSniffer(c, payload)
+		result, err := precheckedHTTPResult, precheckedHTTPError
+		switch {
+		case si.fastHTTP && httpPrechecked:
+		case si.datagramSniffer != nil && datagrams != nil:
+			result, err = si.datagramSniffer(c, payload, datagrams)
+		default:
+			result, err = protocolSniffer(c, payload)
+		}
 		if err == common.ErrNoClue {
 			pendingSniffer = append(pendingSniffer, si)
 			continue
@@ -86,6 +151,9 @@ func (s *Sniffer) Sniff(c context.Context, payload []byte, network net.Network) 
 }
 
 func (s *Sniffer) SniffMetadata(c context.Context) (SniffResult, error) {
+	if !s.hasMetadata {
+		return nil, common.ErrNoClue
+	}
 	var pendingSniffer []protocolSnifferWithMetadata
 	for _, si := range s.sniffer {
 		s := si.protocolSniffer
@@ -139,4 +207,12 @@ type SnifferResultComposite interface {
 
 type SnifferIsProtoSubsetOf interface {
 	IsProtoSubsetOf(protocolName string) bool
+}
+
+type snifferNormalizedDomain interface {
+	DomainNormalized() bool
+}
+
+type simpleNormalizedSniffResult interface {
+	NormalizedProtocolDomain() (protocol, domain string)
 }

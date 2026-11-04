@@ -12,6 +12,10 @@ import (
 	"github.com/xtls/xray-core/features/dns"
 )
 
+// errFakeDNSNotInitialized keeps the message the upstream base logged for this
+// case; the Jolymmiles base marks it AtError(), an API this base lacks.
+var errFakeDNSNotInitialized = errors.New("FakeDNSEngine is not initialized, but such a sniffer is used")
+
 // newFakeDNSSniffer Creates a Fake DNS metadata sniffer
 func newFakeDNSSniffer(ctx context.Context) (protocolSnifferWithMetadata, error) {
 	var fakeDNSEngine dns.FakeDNSEngine
@@ -23,8 +27,7 @@ func newFakeDNSSniffer(ctx context.Context) (protocolSnifferWithMetadata, error)
 	}
 
 	if fakeDNSEngine == nil {
-		errNotInit := errors.New("FakeDNSEngine is not initialized, but such a sniffer is used")
-		return protocolSnifferWithMetadata{}, errNotInit
+		return protocolSnifferWithMetadata{}, errFakeDNSNotInitialized
 	}
 	return protocolSnifferWithMetadata{protocolSniffer: func(ctx context.Context, bytes []byte) (SniffResult, error) {
 		outbounds := session.OutboundsFromContext(ctx)
@@ -91,31 +94,42 @@ func newFakeDNSThenOthers(ctx context.Context, fakeDNSSniffer protocolSnifferWit
 ) { // nolint: unparam
 	// ctx may be used in the future
 	_ = ctx
-	return protocolSnifferWithMetadata{
-		protocolSniffer: func(ctx context.Context, bytes []byte) (SniffResult, error) {
-			ipAddressInRangeValue := &ipAddressInRangeOpt{}
-			ctx = context.WithValue(ctx, ipAddressInRange, ipAddressInRangeValue)
-			result, err := fakeDNSSniffer.protocolSniffer(ctx, bytes)
-			if err == nil {
-				return result, nil
-			}
-			if ipAddressInRangeValue.addressInRange != nil {
-				if *ipAddressInRangeValue.addressInRange {
-					for _, v := range others {
-						if v.metadataSniffer || bytes != nil {
-							if result, err := v.protocolSniffer(ctx, bytes); err == nil {
-								return DNSThenOthersSniffResult{domainName: result.Domain(), protocolOriginalName: result.Protocol()}, nil
-							}
+	sniff := func(ctx context.Context, bytes []byte, datagrams [][]byte) (SniffResult, error) {
+		ipAddressInRangeValue := &ipAddressInRangeOpt{}
+		ctx = context.WithValue(ctx, ipAddressInRange, ipAddressInRangeValue)
+		result, err := fakeDNSSniffer.protocolSniffer(ctx, bytes)
+		if err == nil {
+			return result, nil
+		}
+		if ipAddressInRangeValue.addressInRange != nil {
+			if *ipAddressInRangeValue.addressInRange {
+				for _, v := range others {
+					if v.metadataSniffer || bytes != nil {
+						var result SniffResult
+						var err error
+						if v.datagramSniffer != nil && datagrams != nil {
+							result, err = v.datagramSniffer(ctx, bytes, datagrams)
+						} else {
+							result, err = v.protocolSniffer(ctx, bytes)
+						}
+						if err == nil {
+							return DNSThenOthersSniffResult{domainName: result.Domain(), protocolOriginalName: result.Protocol()}, nil
 						}
 					}
-					return nil, common.ErrNoClue
 				}
-				errors.LogDebug(ctx, "ip address not in fake dns range, return as is")
 				return nil, common.ErrNoClue
 			}
-			errors.LogWarning(ctx, "fake dns sniffer did not set address in range option, assume false.")
+			errors.LogDebug(ctx, "ip address not in fake dns range, return as is")
 			return nil, common.ErrNoClue
+		}
+		errors.LogWarning(ctx, "fake dns sniffer did not set address in range option, assume false.")
+		return nil, common.ErrNoClue
+	}
+	return protocolSnifferWithMetadata{
+		protocolSniffer: func(ctx context.Context, bytes []byte) (SniffResult, error) {
+			return sniff(ctx, bytes, nil)
 		},
+		datagramSniffer: sniff,
 		metadataSniffer: false,
 	}, nil
 }
