@@ -2,9 +2,11 @@ package conf
 
 import (
 	"encoding/json"
+	"fmt"
 
 	"github.com/xtls/xray-core/app/speedlimit"
 	"github.com/xtls/xray-core/common/errors"
+	"github.com/xtls/xray-core/transport/internet/splithttp"
 )
 
 // SpeedlimitConfig is the "speedLimit" section of the top-level config file.
@@ -62,4 +64,63 @@ func (c *SpeedlimitConfig) Build() (*speedlimit.Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// applySpeedlimitUploadDefaults keeps throttled uploads from stalling other flows on
+// connections shared through HTTP/2 or QUIC. Values set in the config are left alone.
+func applySpeedlimitUploadDefaults(inbounds []InboundDetourConfig, cfg *speedlimit.Config) {
+	stream := cfg.UploadStreamBuffer()
+	if stream == 0 {
+		return
+	}
+	splithttp.EnablePostReadLimit()
+	connection := max(16*1024*1024, 16*stream)
+	for i := range inbounds {
+		s := inbounds[i].StreamSetting
+		if s == nil || s.Network == nil {
+			continue
+		}
+		network, err := s.Network.Build()
+		if err != nil {
+			continue
+		}
+		switch network {
+		case "splithttp":
+			x := s.XHTTPSettings
+			if x == nil {
+				x = s.SplitHTTPSettings
+			}
+			if x == nil {
+				x = new(SplitHTTPConfig)
+				s.XHTTPSettings = x
+			}
+			if len(x.H2Params) == 0 {
+				x.H2Params = json.RawMessage(fmt.Sprintf(
+					`{"MaxReceiveBufferPerStream":%d,"MaxReceiveBufferPerConnection":%d}`, stream, connection))
+			}
+		case "hysteria":
+		default:
+			continue
+		}
+		if s.FinalMask == nil {
+			s.FinalMask = new(FinalMask)
+		}
+		if s.FinalMask.QuicParams == nil {
+			s.FinalMask.QuicParams = new(QuicParamsConfig)
+		}
+		q := s.FinalMask.QuicParams
+		if q.InitStreamReceiveWindow == 0 {
+			// Short-lived packet-up streams would never grow a smaller starting window.
+			q.InitStreamReceiveWindow = uint64(stream)
+		}
+		if q.MaxStreamReceiveWindow == 0 {
+			q.MaxStreamReceiveWindow = uint64(stream)
+		}
+		if q.InitConnectionReceiveWindow == 0 {
+			q.InitConnectionReceiveWindow = uint64(connection)
+		}
+		if q.MaxConnectionReceiveWindow == 0 {
+			q.MaxConnectionReceiveWindow = uint64(connection)
+		}
+	}
 }

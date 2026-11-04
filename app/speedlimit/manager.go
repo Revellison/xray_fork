@@ -143,6 +143,19 @@ func (m *Manager) User(email string) *UserLimiter {
 	return u
 }
 
+func (m *Manager) udpMaxDelayDuration() time.Duration {
+	return time.Duration(m.udpMaxDelay.Load()) * time.Millisecond
+}
+
+// MayLimit reports whether this user can ever be limited, now or through a penalty.
+// Callers keep zero-copy paths such as splice for users for whom it returns false.
+func (u *UserLimiter) MayLimit() bool {
+	if u == nil {
+		return false
+	}
+	return u.down.mayLimit() || u.up.mayLimit()
+}
+
 // Close останавливает менеджер.
 func (m *Manager) Close() error {
 	if m == nil {

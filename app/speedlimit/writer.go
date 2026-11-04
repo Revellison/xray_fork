@@ -108,64 +108,82 @@ func (w *Writer) WriteMultiBuffer(mb buf.MultiBuffer) error {
 }
 
 func (w *Writer) wait(n int) error {
+	return waitTokens(w.ctx, w.done, w.d, n)
+}
+
+// waitTokens blocks until n tokens are taken. A nil done never fires.
+func waitTokens(ctx context.Context, done <-chan struct{}, d *dir, n int) error {
 	for {
-		dur := w.d.bkt.tryTake(n)
+		dur := d.bkt.tryTake(n)
 		if dur == 0 {
 			return nil
 		}
 		t := time.NewTimer(dur)
 		select {
 		case <-t.C:
-		case <-w.ctx.Done():
+		case <-ctx.Done():
 			t.Stop()
-			return w.ctx.Err()
-		case <-w.done:
+			return ctx.Err()
+		case <-done:
 			t.Stop()
 			return io.ErrClosedPipe
 		}
-		if w.d.bkt.unlimited.Load() {
+		if d.bkt.unlimited.Load() {
 			return nil
 		}
 	}
 }
 
-func (w *Writer) writeUDP(mb buf.MultiBuffer) error {
-	maxDelay := time.Duration(w.m.udpMaxDelay.Load())
-	for _, b := range mb {
-		size := int(b.Len())
-		deadline := time.Now().Add(maxDelay)
-		dropped := false
-		for {
-			dur := w.d.bkt.tryTake(size)
-			if dur == 0 {
-				break
-			}
-			if time.Now().Add(dur).After(deadline) {
-				b.Release()
-				dropped = true
-				break
-			}
-			t := time.NewTimer(dur)
-			select {
-			case <-t.C:
-			case <-w.ctx.Done():
-				t.Stop()
-				buf.ReleaseMulti(mb)
-				return w.ctx.Err()
-			case <-w.done:
-				t.Stop()
-				buf.ReleaseMulti(mb)
-				return io.ErrClosedPipe
-			}
+// admitUDP waits up to maxDelay for tokens. It returns false if the datagram must be dropped.
+func admitUDP(ctx context.Context, done <-chan struct{}, d *dir, size int, maxDelay time.Duration) (bool, error) {
+	deadline := time.Now().Add(maxDelay)
+	for {
+		dur := d.bkt.tryTake(size)
+		if dur == 0 {
+			return true, nil
 		}
-		if !dropped {
-			w.d.recordBytes(b.Len())
-			if err := w.inner.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
-				return err
-			}
+		if time.Now().Add(dur).After(deadline) {
+			return false, nil
+		}
+		t := time.NewTimer(dur)
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+			t.Stop()
+			return false, ctx.Err()
+		case <-done:
+			t.Stop()
+			return false, io.ErrClosedPipe
+		}
+	}
+}
+
+func (w *Writer) writeUDP(mb buf.MultiBuffer) error {
+	maxDelay := w.m.udpMaxDelayDuration()
+	for i, b := range mb {
+		admitted, err := admitUDP(w.ctx, w.done, w.d, int(b.Len()), maxDelay)
+		if err != nil {
+			// Earlier buffers were already handed downstream or released.
+			buf.ReleaseMulti(mb[i:])
+			return err
+		}
+		if !admitted {
+			b.Release()
+			continue
+		}
+		w.d.recordBytes(b.Len())
+		if err := w.inner.WriteMultiBuffer(buf.MultiBuffer{b}); err != nil {
+			buf.ReleaseMulti(mb[i+1:])
+			return err
 		}
 	}
 	return nil
+}
+
+func (d *dir) mayLimit() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.baseKbps > 0 || d.penaltyOn
 }
 
 func (d *dir) recordBytes(n int32) {

@@ -6,7 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xtls/xray-core/app/speedlimit"
 	"github.com/xtls/xray-core/common"
 	"github.com/xtls/xray-core/common/buf"
 	"github.com/xtls/xray-core/common/errors"
@@ -243,13 +242,7 @@ func (d *DefaultDispatcher) getLink(ctx context.Context, network net.Network) (*
 			trackOnlineIP(ctx, d.stats, user.Email, sessionInbound.Source.Address.String())
 		}
 
-		// Per-user rate limiting. Default() is nil when the config has no
-		// "speedLimit" section, and User() returns nil for unlimited users,
-		// so the whole block costs nothing when the feature is off.
-		if us := speedlimit.Default().User(user.Email); us != nil {
-			inboundLink.Writer = us.WrapUp(ctx, inboundLink.Writer, network)
-			outboundLink.Writer = us.WrapDown(ctx, outboundLink.Writer, network)
-		}
+		limitPipeLink(ctx, sessionInbound, user.Email, network, inboundLink, outboundLink) // fork
 	}
 
 	return inboundLink, outboundLink
@@ -262,6 +255,7 @@ func WrapLink(ctx context.Context, policyManager policy.Manager, statsManager st
 		user = sessionInbound.User
 	}
 
+	limitDirectLink(ctx, sessionInbound, user, link) // fork
 	link.Reader = &buf.TimeoutWrapperReader{Reader: link.Reader}
 
 	if user != nil && len(user.Email) > 0 {

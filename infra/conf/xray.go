@@ -677,6 +677,11 @@ func (c *Config) Build() (*core.Config, error) {
 
 	if c.Reverse != nil {
 		return nil, errors.PrintRemovedFeatureError(`"legacy reverse"`, `"VLESS Reverse Proxy"`)
+		r, err := c.Reverse.Build()
+		if err != nil {
+			return nil, errors.New("failed to build reverse configuration").Base(err)
+		}
+		config.App = append(config.App, serial.ToTypedMessage(r))
 	}
 
 	if c.FakeDNS != nil {
@@ -727,6 +732,7 @@ func (c *Config) Build() (*core.Config, error) {
 		if err := speedlimit.SetEmbeddedConfig(slCfg); err != nil {
 			return nil, errors.New("failed to install speedLimit configuration").Base(err)
 		}
+		applySpeedlimitUploadDefaults(c.InboundConfigs, slCfg)
 	}
 	// Initialize the inbound module last to ensure inbound connections are handled correctly.
 	config.App = append(config.App, serial.ToTypedMessage(&proxyman.InboundConfig{}))

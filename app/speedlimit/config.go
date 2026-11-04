@@ -94,3 +94,51 @@ type Config struct {
 	ByEmail            map[string]resolvedRule // ключ: lower(trim(email))
 	Profiles           map[string]*profile
 }
+
+const (
+	minUploadStreamBuffer = 256 * 1024
+	maxUploadStreamBuffer = 4 * 1024 * 1024
+	uploadBufferRTT       = 100 // ms of the fastest limit that one stream may buffer
+)
+
+// UploadStreamBuffer returns the per-stream receive buffer for inbounds that share one
+// connection between flows, or 0 if no user can be limited on upload. Backpressure on a
+// limited stream fills its buffer, so the connection window must exceed the sum of the
+// stalled streams' buffers, or those streams stall the whole connection.
+func (c *Config) UploadStreamBuffer() int64 {
+	if c == nil || !c.Enabled {
+		return 0
+	}
+	limited := false
+	var fastest int64
+	unlimited := false
+	check := func(r resolvedRule) {
+		if r.upKbps > 0 || (c.Penalties && r.upProf != nil) {
+			limited = true
+		}
+		if r.upKbps == 0 {
+			unlimited = true
+		}
+		if r.upKbps > fastest {
+			fastest = r.upKbps
+		}
+	}
+	check(c.Default)
+	for _, r := range c.ByEmail {
+		check(r)
+	}
+	if !limited {
+		return 0
+	}
+	if unlimited {
+		return maxUploadStreamBuffer
+	}
+	buffer := fastest * 125 * uploadBufferRTT / 1000
+	if buffer < minUploadStreamBuffer {
+		return minUploadStreamBuffer
+	}
+	if buffer > maxUploadStreamBuffer {
+		return maxUploadStreamBuffer
+	}
+	return buffer
+}

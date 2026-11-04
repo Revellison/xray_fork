@@ -287,6 +287,11 @@ func (h *requestHandler) ServeHTTP(writer http.ResponseWriter, request *http.Req
 			}
 		}
 
+		if !currentSession.uploadQueue.enterPostRead(writer, request) { // fork
+			return
+		}
+		defer currentSession.uploadQueue.leavePostRead() // fork
+
 		var bodyPayload []byte
 		if dataPlacement == PlacementAuto || dataPlacement == PlacementBody {
 			var readErr error

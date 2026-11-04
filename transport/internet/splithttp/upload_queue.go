@@ -25,6 +25,7 @@ type uploadQueue struct {
 	nextSeq       uint64
 	maxPackets    int
 	closed        *done.Instance
+	postSlots     chan struct{} // fork: see upload_queue_fork.go
 }
 
 func NewUploadQueue(maxPackets int) *uploadQueue {
@@ -34,6 +35,7 @@ func NewUploadQueue(maxPackets int) *uploadQueue {
 		nextSeq:       0,
 		closed:        done.New(),
 		maxPackets:    maxPackets,
+		postSlots:     newPostSlots(), // fork
 	}
 }
 
