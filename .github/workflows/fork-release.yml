@@ -1,0 +1,292 @@
+name: Fork Build and Release
+
+# Tests and cross-compiles every target on each push to main and on pull requests.
+# Publishes a GitHub release only when asked to (run by hand with "publish", or
+# called from fork-sync-upstream.yml). Nothing is published unless every target
+# builds. Upstream's release.yml stays in the tree but is disabled on this repo.
+# See FORK_MAINTENANCE.md.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag or commit to build"
+        type: string
+        default: main
+      publish:
+        description: "Publish a GitHub release"
+        type: boolean
+        default: true
+      tag:
+        description: "Release tag (empty: v<core version>-fork.<next number>)"
+        type: string
+        default: ""
+  workflow_call:
+    inputs:
+      ref:
+        type: string
+        required: true
+      publish:
+        type: boolean
+        default: false
+      tag:
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  WINTUN_VERSION: 0.14.1
+  WINTUN_SHA256: 07c256185d6ee3652e09fa55c0b673e2624b565e02c4b9091c79ca7d2f24ef51
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.meta.outputs.sha }}
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          fetch-depth: 0
+
+      - name: Resolve commit, version and tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          PUBLISH: ${{ inputs.publish }}
+        run: |
+          part() { sed -n "s/.*Version_$1 byte = \([0-9]*\).*/\1/p" core/core.go; }
+          version="$(part x).$(part y).$(part z)"
+          echo "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "Cannot read version: $version"; exit 1; }
+          tag=""
+          if [ "$PUBLISH" = "true" ]; then
+            tag="$INPUT_TAG"
+            if [ -z "$tag" ]; then
+              last="$(git tag --list "v$version-fork.*" | sed 's/.*-fork\.//' | sort -n | tail -n 1)"
+              tag="v$version-fork.$(( ${last:-0} + 1 ))"
+            fi
+            echo "$tag" | grep -Eq '^v[0-9A-Za-z._-]+$' || { echo "Invalid tag: $tag"; exit 1; }
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "Tag $tag already exists"; exit 1
+            fi
+          fi
+          {
+            echo "sha=$(git rev-parse HEAD)"
+            echo "version=$version"
+            echo "tag=$tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "Version $version, commit $(git rev-parse --short HEAD), tag '${tag:-none}'" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Download geodata and Wintun
+        run: |
+          mkdir -p resources
+          base="https://raw.githubusercontent.com/XTLS/Xray-rules-dat/release"
+          fetch_dat() {
+            curl -fsSL --retry 5 "$base/$1.dat" -o "resources/$2.dat"
+            want="$(curl -fsSL --retry 5 "$base/$1.dat.sha256sum" | awk '{print $1}')"
+            echo "$want  resources/$2.dat" | sha256sum -c -
+          }
+          fetch_dat geoip/geoip-lite geoip
+          fetch_dat geosite/geosite geosite
+          curl -fsSL --retry 5 "https://www.wintun.net/builds/wintun-$WINTUN_VERSION.zip" -o wintun.zip
+          echo "$WINTUN_SHA256  wintun.zip" | sha256sum -c -
+          unzip -q wintun.zip -d resources/
+
+      - name: Share assets with build jobs
+        uses: actions/upload-artifact@v7
+        with:
+          name: fork-assets
+          path: resources
+          retention-days: 1
+
+  test:
+    needs: prepare
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Vet and test fork packages
+        run: |
+          go vet ./app/speedlimit/... ./app/dispatcher/... ./common/protocol/... ./infra/conf/... ./core/...
+          go test -race -count=1 -timeout 30m ./app/speedlimit/... ./app/dispatcher/... ./common/protocol/... ./infra/conf/... ./core/...
+
+  build:
+    needs: [prepare, test]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Mirrors upstream's .github/workflows/release.yml.
+        goos: [windows, freebsd, openbsd, linux, darwin]
+        goarch: [amd64, "386"]
+        patch-assetname: [""]
+        exclude:
+          - goarch: "386"
+            goos: darwin
+        include:
+          - { goos: darwin, goarch: arm64 }
+          - { goos: linux, goarch: arm, goarm: 7 }
+          - { goos: linux, goarch: arm, goarm: 6 }
+          - { goos: linux, goarch: arm, goarm: 5 }
+          - { goos: android, goarch: arm64 }
+          - { goos: android, goarch: amd64, patch-assetname: android-amd64 }
+          - { goos: windows, goarch: arm64 }
+          - { goos: linux, goarch: arm64 }
+          - { goos: linux, goarch: riscv64 }
+          - { goos: linux, goarch: loong64 }
+          - { goos: linux, goarch: mips64 }
+          - { goos: linux, goarch: mips64le }
+          - { goos: linux, goarch: mipsle }
+          - { goos: linux, goarch: mips }
+          - { goos: linux, goarch: ppc64 }
+          - { goos: linux, goarch: ppc64le }
+          - { goos: freebsd, goarch: arm64 }
+          - { goos: freebsd, goarch: arm, goarm: 7 }
+          - { goos: linux, goarch: s390x }
+          - { goos: openbsd, goarch: arm64 }
+          - { goos: openbsd, goarch: arm, goarm: 7 }
+    env:
+      GOOS: ${{ matrix.goos }}
+      GOARCH: ${{ matrix.goarch }}
+      GOARM: ${{ matrix.goarm }}
+      CGO_ENABLED: 0
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+
+      - name: Set up NDK
+        if: matrix.goos == 'android'
+        run: |
+          wget -qO android-ndk.zip https://dl.google.com/android/repository/android-ndk-r28b-linux.zip
+          unzip -q android-ndk.zip
+          rm android-ndk.zip
+          declare -A arches=(
+            ["amd64"]="x86_64-linux-android24-clang"
+            ["arm64"]="aarch64-linux-android24-clang"
+          )
+          echo CC="$(realpath android-ndk-*/toolchains/llvm/prebuilt/linux-x86_64/bin)/${arches[$GOARCH]}" >> "$GITHUB_ENV"
+          echo CGO_ENABLED=1 >> "$GITHUB_ENV"
+
+      - name: Resolve asset name
+        env:
+          PATCH_NAME: ${{ matrix.patch-assetname }}
+        run: |
+          name="$PATCH_NAME"
+          [ -n "$name" ] || name="$(jq -r ".[\"$GOOS-$GOARCH$GOARM\"].friendlyName" < .github/build/friendly-filenames.json)"
+          [ -n "$name" ] && [ "$name" != "null" ] || { echo "No friendly name for $GOOS-$GOARCH$GOARM"; exit 1; }
+          echo "ASSET_NAME=$name" >> "$GITHUB_ENV"
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build Xray
+        env:
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          mkdir -p build_assets
+          x="-X github.com/xtls/xray-core/core.build=fork-${SHA:0:7} -s -w -buildid="
+          out=build_assets/xray
+          gc="all=-l=4"
+          case "$GOOS" in
+            windows) out=build_assets/xray.exe ;;
+            android) x="$x -checklinkname=0" ;;
+          esac
+          case "$GOARCH" in
+            mips|mipsle) gc="-l=4" ;;
+          esac
+          go build -o "$out" -trimpath -buildvcs=false -gcflags="$gc" -ldflags="$x" ./main
+          if [ "$GOARCH" = mips ] || [ "$GOARCH" = mipsle ]; then
+            GOMIPS=softfloat go build -o build_assets/xray_softfloat -trimpath -buildvcs=false -gcflags="$gc" -ldflags="$x" ./main
+          fi
+
+      - name: Fetch assets
+        uses: actions/download-artifact@v8
+        with:
+          name: fork-assets
+          path: resources
+
+      - name: Package
+        run: |
+          mv resources/geoip.dat resources/geosite.dat build_assets/
+          cp README.md LICENSE build_assets/
+          if [ "$GOOS" = windows ]; then
+            cp .github/build/windows/* build_assets/
+            case "$GOARCH" in
+              amd64) dir=amd64 ;;
+              386) dir=x86 ;;
+              arm64) dir=arm64 ;;
+            esac
+            cp "resources/wintun/bin/$dir/wintun.dll" build_assets/
+            cp resources/wintun/LICENSE.txt build_assets/LICENSE-Wintun
+          fi
+          (cd build_assets && zip -9qr "../Xray-$ASSET_NAME.zip" .)
+
+      - name: Upload package
+        uses: actions/upload-artifact@v7
+        with:
+          name: Xray-${{ env.ASSET_NAME }}
+          path: Xray-${{ env.ASSET_NAME }}.zip
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    needs: [prepare, build]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Collect packages
+        uses: actions/download-artifact@v8
+        with:
+          pattern: Xray-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          SHA: ${{ needs.prepare.outputs.sha }}
+        run: |
+          (cd dist && sha256sum Xray-*.zip > SHA256SUMS.txt)
+          cat > notes.md <<EOF
+          Xray-core $VERSION with this fork's additions, built from \`$SHA\`.
+
+          **Fork additions**
+          - Per-user speed limiter: \`speedLimit\` section in \`config.json\`, with down/up limits and penalty ladders. See [docs/FORK_NOTES.md](https://github.com/$GH_REPO/blob/$TAG/docs/FORK_NOTES.md).
+          - Extended sniffing: QUIC v2, ClientHello reassembly across QUIC packets and TLS records, BitTorrent uTP, DHT and UDP tracker.
+
+          Verify a download with \`sha256sum -c SHA256SUMS.txt --ignore-missing\`.
+
+          Upstream release notes: https://github.com/XTLS/Xray-core/releases/tag/v$VERSION
+          EOF
+          sed -i 's/^          //' notes.md
+          gh release create "$TAG" dist/* --target "$SHA" --title "Xray-core fork $TAG" --notes-file notes.md --latest

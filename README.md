@@ -1,3 +1,5 @@
+> **This is a fork of [XTLS/Xray-core](https://github.com/XTLS/Xray-core)** with a per-user speed limiter and extended sniffing (QUIC v2, ClientHello reassembly, BitTorrent uTP/DHT/UDP tracker). See [docs/FORK_NOTES.md](docs/FORK_NOTES.md) and [FORK_MAINTENANCE.md](FORK_MAINTENANCE.md). Please report fork-specific problems here, not upstream.
+
 # Project X
 
 [Project X](https://github.com/XTLS) originates from XTLS protocol, providing a set of network tools such as [Xray-core](https://github.com/XTLS/Xray-core) and [REALITY](https://github.com/XTLS/REALITY).

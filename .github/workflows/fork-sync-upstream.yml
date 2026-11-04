@@ -1,0 +1,147 @@
+name: Fork Sync Upstream
+
+# Run by hand from the Actions tab. Merges an upstream ref into the fork, verifies
+# it, pushes, then builds and (optionally) publishes a release. On a conflict or a
+# failed verification nothing is pushed and an issue is opened.
+# See FORK_MAINTENANCE.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream ref: latest-release, main, a tag, or a commit SHA"
+        type: string
+        default: latest-release
+      release:
+        description: "Publish a release after a successful sync"
+        type: boolean
+        default: true
+      dry_run:
+        description: "Merge and verify only; push nothing"
+        type: boolean
+        default: false
+      target_branch:
+        description: "Branch to sync (main unless testing this workflow)"
+        type: string
+        default: main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-sync-upstream
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+    outputs:
+      merged: ${{ steps.sync.outputs.merged }}
+      sha: ${{ steps.sync.outputs.sha }}
+    steps:
+      - name: Checkout codebase
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.target_branch }}
+          fetch-depth: 0
+          # GITHUB_TOKEN may not push commits that change .github/workflows.
+          # FORK_SYNC_TOKEN is only needed when upstream changes those files.
+          token: ${{ secrets.FORK_SYNC_TOKEN || github.token }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Merge, verify and push
+        id: sync
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GOTOOLCHAIN: auto
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          TARGET_BRANCH: ${{ inputs.target_branch }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          report_failure() {
+            local title="Upstream sync failed: $1"
+            {
+              echo "$2"
+              echo
+              echo "Run: $RUN_URL"
+              echo
+              echo "Nothing was pushed. Follow \`FORK_MAINTENANCE.md\` to resolve this locally."
+              echo
+              echo '```text'
+              tail -n 80 sync.log
+              echo '```'
+            } > issue.md
+            cat issue.md >> "$GITHUB_STEP_SUMMARY"
+            local existing
+            existing="$(gh issue list --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')"
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body-file issue.md
+            else
+              gh issue create --title "$title" --body-file issue.md
+            fi
+          }
+
+          set +e
+          bash .github/fork/sync-upstream.sh "$UPSTREAM_REF" 2>&1 | tee sync.log
+          code=${PIPESTATUS[0]}
+          set -e
+          ref="$(sed -n 's/^SYNC_REF=//p' sync.log | head -n 1)"
+          ref="${ref:-$UPSTREAM_REF}"
+
+          case "$code" in
+            0) ;;
+            10)
+              echo "Already up to date with upstream $ref." >> "$GITHUB_STEP_SUMMARY"
+              echo "merged=false" >> "$GITHUB_OUTPUT"
+              exit 0
+              ;;
+            20)
+              report_failure "$ref" "Merging upstream \`$ref\` produced conflicts."
+              exit 1
+              ;;
+            30)
+              report_failure "$ref" "Upstream \`$ref\` merged cleanly, but the result does not build or pass tests."
+              exit 1
+              ;;
+            *)
+              echo "Sync script failed with exit code $code." >> "$GITHUB_STEP_SUMMARY"
+              exit "$code"
+              ;;
+          esac
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "Dry run: upstream $ref merges and verifies cleanly. Nothing pushed." >> "$GITHUB_STEP_SUMMARY"
+            echo "merged=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! git push origin "HEAD:refs/heads/$TARGET_BRANCH" >> sync.log 2>&1; then
+            report_failure "$ref" "The merge verified, but the push was rejected. If upstream changed \`.github/workflows\`, set the \`FORK_SYNC_TOKEN\` secret or push the merge locally."
+            exit 1
+          fi
+
+          echo "Synced \`$TARGET_BRANCH\` with upstream \`$ref\`." >> "$GITHUB_STEP_SUMMARY"
+          echo "merged=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # Pushes made with GITHUB_TOKEN do not trigger workflows, so build explicitly.
+  build-and-release:
+    needs: sync
+    if: needs.sync.outputs.merged == 'true'
+    permissions:
+      contents: write
+    uses: ./.github/workflows/fork-release.yml
+    with:
+      ref: ${{ needs.sync.outputs.sha }}
+      publish: ${{ inputs.release }}
