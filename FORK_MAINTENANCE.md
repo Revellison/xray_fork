@@ -169,11 +169,20 @@ The sync script prints files changed by both sides. Read those diffs even when a
 | `fork-release.yml` | Fork | Tests and builds on push/PR; publishes when run by hand or from sync |
 | `test.yml` | Upstream, enabled | Full test suite and format/proto checks |
 | `scheduled-assets-update.yml` | Upstream, enabled | Geodata cache used by `test.yml` |
-| `release.yml`, `release-win7.yml`, `docker.yml` | Upstream, **disabled in repo settings** | Replaced by `fork-release.yml` |
+| `release.yml`, `release-win7.yml`, `docker.yml` | Upstream | Superseded by `fork-release.yml`; the owner decides whether they stay enabled. Check with `gh workflow list --all` |
 
-The disabled workflows stay in the tree, so merges do not conflict. Disabling is repository
-state, not a file change: `gh workflow disable release.yml`. Windows 7 and Docker builds
-are therefore not produced.
+Keep these files in the tree, so merges do not conflict. Turning them off is repository
+state, not a file change, and is the owner's decision: they run on every push, and
+`release.yml` logs a harmless 403 from `check-assets` when the geodata cache is empty.
+`fork-release.yml` does not depend on them. It does not build Windows 7 or Docker images.
+
+`dependabot.yml` comes from upstream and opens PRs on this repository. Do not merge them:
+the same bumps arrive with the next sync.
+
+`fork-release.yml` runs `-race` on the packages the fork changes, but not on `./core/...`:
+upstream's `testing/servers/udp` helper races on `Server.accepting`, which fails
+`TestXrayDialUDP` and `TestXrayDialUDPConn`. Do not patch that helper here; it is upstream's
+file. Remove the exception if upstream fixes it.
 
 **Do not edit upstream workflows; edit `fork-*.yml`.** When the sync script warns that the
 release matrix changed, port the change to the matrix in `fork-release.yml`.

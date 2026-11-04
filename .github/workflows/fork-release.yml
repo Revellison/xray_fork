@@ -3,7 +3,7 @@ name: Fork Build and Release
 # Tests and cross-compiles every target on each push to main and on pull requests.
 # Publishes a GitHub release only when asked to (run by hand with "publish", or
 # called from fork-sync-upstream.yml). Nothing is published unless every target
-# builds. Upstream's release.yml stays in the tree but is disabled on this repo.
+# builds. This replaces upstream's release.yml for publishing.
 # See FORK_MAINTENANCE.md.
 
 on:
